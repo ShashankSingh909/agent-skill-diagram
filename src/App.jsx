@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   addEdge,
   Background,
@@ -25,6 +25,7 @@ import {
 } from "@phosphor-icons/react";
 import { ArchitectureNode } from "./components/ArchitectureNode.jsx";
 import { ComponentLibrary } from "./components/ComponentLibrary.jsx";
+import { EdgeInspector } from "./components/EdgeInspector.jsx";
 import { FilePreview } from "./components/FilePreview.jsx";
 import { FileTreeView } from "./components/FileTreeView.jsx";
 import { Inspector } from "./components/Inspector.jsx";
@@ -48,11 +49,14 @@ function Workspace() {
   const [reactFlow, setReactFlow] = useState(null);
   const [mode, setMode] = useState("mind");
   const [selectedId, setSelectedId] = useState("skill-research");
+  const [selectedEdgeId, setSelectedEdgeId] = useState(null);
+  const [focusRequest, setFocusRequest] = useState(null);
   const [showFiles, setShowFiles] = useState(false);
   const [showIssues, setShowIssues] = useState(false);
   const [toast, setToast] = useState("");
 
   const selectedNode = nodes.find((node) => node.id === selectedId) ?? null;
+  const selectedEdge = edges.find((edge) => edge.id === selectedEdgeId) ?? null;
   const issues = useMemo(() => validateProject(nodes, edges), [nodes, edges]);
   const files = useMemo(() => generateProjectFiles(nodes, edges), [nodes, edges]);
   const errors = issues.filter((issue) => issue.severity === "error").length;
@@ -63,18 +67,27 @@ function Workspace() {
       edges.map((edge) => {
         const source = nodes.find((node) => node.id === edge.source);
         const color = kindMeta[source?.data.kind]?.color ?? "#5a72a0";
+        const isSelected = edge.id === selectedEdgeId;
         return {
           ...edge,
           type: "smoothstep",
-          style: { stroke: color, strokeWidth: 2 },
+          selected: isSelected,
+          style: {
+            stroke: color,
+            strokeWidth: isSelected ? 3 : 2,
+            strokeDasharray: edge.data?.dashed ? "7 5" : undefined,
+          },
           markerEnd: { type: MarkerType.ArrowClosed, color },
         };
       }),
-    [edges, nodes],
+    [edges, nodes, selectedEdgeId],
   );
 
   const onConnect = useCallback(
-    (connection) => setEdges((current) => addEdge({ ...connection, id: crypto.randomUUID() }, current)),
+    (connection) =>
+      setEdges((current) =>
+        addEdge({ ...connection, id: crypto.randomUUID(), data: {} }, current),
+      ),
     [setEdges],
   );
 
@@ -87,6 +100,7 @@ function Workspace() {
       const next = createNode(kind, position ?? fallback, sequenceRef.current++);
       setNodes((current) => [...current, next]);
       setSelectedId(next.id);
+      setSelectedEdgeId(null);
       setMode("mind");
     },
     [setNodes],
@@ -125,6 +139,69 @@ function Workspace() {
     );
     setSelectedId(null);
   };
+
+  // Select a node and pan/zoom the canvas to it (used by the validation popover).
+  const revealNode = useCallback(
+    (nodeId) => {
+      if (!nodeId) return;
+      setSelectedId(nodeId);
+      setSelectedEdgeId(null);
+      setNodes((current) =>
+        current.map((node) => ({ ...node, selected: node.id === nodeId })),
+      );
+      setShowIssues(false);
+      setMode("mind");
+      setFocusRequest(nodeId);
+    },
+    [setNodes],
+  );
+
+  const onEdgeClick = useCallback((_, edge) => {
+    setSelectedEdgeId(edge.id);
+    setSelectedId(null);
+  }, []);
+
+  const toggleEdgeDashed = () => {
+    setEdges((current) =>
+      current.map((edge) =>
+        edge.id === selectedEdgeId
+          ? { ...edge, data: { ...edge.data, dashed: !edge.data?.dashed } }
+          : edge,
+      ),
+    );
+  };
+
+  const toggleEdgeAnimated = () => {
+    setEdges((current) =>
+      current.map((edge) =>
+        edge.id === selectedEdgeId ? { ...edge, animated: !edge.animated } : edge,
+      ),
+    );
+  };
+
+  const deleteSelectedEdge = () => {
+    if (!selectedEdgeId) return;
+    setEdges((current) => current.filter((edge) => edge.id !== selectedEdgeId));
+    setSelectedEdgeId(null);
+  };
+
+  // React Flow's instance is re-created whenever the canvas remounts, so drop the
+  // stale reference when leaving the mind map. The focus effect waits for the fresh one.
+  useEffect(() => {
+    if (mode !== "mind") setReactFlow(null);
+  }, [mode]);
+
+  // Pan/zoom to a requested node once the canvas (and its instance) is ready.
+  useEffect(() => {
+    if (!focusRequest || mode !== "mind" || !reactFlow) return;
+    reactFlow.fitView({
+      nodes: [{ id: focusRequest }],
+      duration: 600,
+      padding: 0.6,
+      maxZoom: 1.3,
+    });
+    setFocusRequest(null);
+  }, [focusRequest, mode, reactFlow]);
 
   const exportBlueprint = () => {
     const payload = JSON.stringify({ nodes, edges, files }, null, 2);
@@ -210,8 +287,9 @@ function Workspace() {
                   <button
                     type="button"
                     key={issue.message}
-                    onClick={() => issue.nodeId && setSelectedId(issue.nodeId)}
-                    className={issue.severity}
+                    onClick={() => revealNode(issue.nodeId)}
+                    className={`${issue.severity}${issue.nodeId ? "" : " no-target"}`}
+                    disabled={!issue.nodeId}
                   >
                     {issue.message}
                   </button>
@@ -230,8 +308,25 @@ function Workspace() {
                 onNodesChange={onNodesChange}
                 onEdgesChange={onEdgesChange}
                 onConnect={onConnect}
-                onNodeClick={(_, node) => setSelectedId(node.id)}
-                onPaneClick={() => setSelectedId(null)}
+                onNodeClick={(_, node) => {
+                  setSelectedId(node.id);
+                  setSelectedEdgeId(null);
+                }}
+                onEdgeClick={onEdgeClick}
+                onPaneClick={() => {
+                  setSelectedId(null);
+                  setSelectedEdgeId(null);
+                }}
+                onEdgesDelete={(deleted) => {
+                  if (deleted.some((edge) => edge.id === selectedEdgeId)) {
+                    setSelectedEdgeId(null);
+                  }
+                }}
+                onBeforeDelete={async ({ nodes: nodesToDelete, edges: edgesToDelete }) =>
+                  // Keep node deletion exclusive to the inspector button; the Delete
+                  // key only removes connections.
+                  nodesToDelete.length > 0 ? false : { nodes: [], edges: edgesToDelete }
+                }
                 onDrop={onDrop}
                 onDragOver={(event) => {
                   event.preventDefault();
@@ -241,7 +336,7 @@ function Workspace() {
                 fitViewOptions={{ padding: 0.18 }}
                 minZoom={0.35}
                 maxZoom={1.8}
-                deleteKeyCode={null}
+                deleteKeyCode={["Backspace", "Delete"]}
               >
                 <Background variant={BackgroundVariant.Dots} gap={22} size={1.2} color="#273146" />
                 <MiniMap
@@ -257,12 +352,22 @@ function Workspace() {
             {mode === "runtime" && <RuntimeView />}
           </div>
         </section>
-        <Inspector
-          node={selectedNode}
-          issues={issues}
-          onChange={updateSelected}
-          onDelete={deleteSelected}
-        />
+        {selectedEdge ? (
+          <EdgeInspector
+            edge={selectedEdge}
+            nodes={nodes}
+            onToggleDashed={toggleEdgeDashed}
+            onToggleAnimated={toggleEdgeAnimated}
+            onDelete={deleteSelectedEdge}
+          />
+        ) : (
+          <Inspector
+            node={selectedNode}
+            issues={issues}
+            onChange={updateSelected}
+            onDelete={deleteSelected}
+          />
+        )}
       </div>
 
       <footer className="statusbar">
